@@ -4,29 +4,54 @@ import os
 import asyncio
 from dotenv import load_dotenv
 import mysql.connector
-import google.generativeai as genai
+from google import genai
+from google.genai import types  # Ensure types is imported
 from datetime import datetime
+import traceback # For detailed error logging
+from pathlib import Path # Pathを追加
 
 # --- 環境変数の読み込み ---
-load_dotenv()
+# .envファイルへのパスを明示的に指定
+# このスクリプト(main.py)の親ディレクトリ(src/)の親ディレクトリ(プロジェクトルート)にある .env ファイルを指す
+dotenv_path = Path(__file__).resolve().parent.parent / '.env'
+print(f"{dotenv_path=}")
+
+try:
+    dotenv_loaded = load_dotenv(dotenv_path=dotenv_path)
+    if dotenv_loaded:
+        print(f".envファイルが読み込まれました: {dotenv_path}")
+    else:
+        print(f"警告: .envファイルが見つからないか、空です: {dotenv_path}")
+except Exception as e:
+    print(f"環境変数の読み込みエラー: {e}")
+
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 MYSQL_HOST = os.getenv('MYSQL_HOST')
 MYSQL_USER = os.getenv('MYSQL_USER')
 MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD')
 MYSQL_DATABASE = os.getenv('MYSQL_DATABASE')
-MYSQL_PORT = os.getenv('MYSQL_PORT', 3306)  # デフォルトポート
+# MYSQL_PORT を文字列として取得し、コメントを除去してから整数に変換
+raw_mysql_port = os.getenv('MYSQL_PORT', '3306')
+MYSQL_PORT = raw_mysql_port.split('#')[0].strip().strip('"').strip("'")
 
 # --- Gemini APIの初期設定 ---
+GEMINI_MODEL_NAME = "gemini-2.5-flash-preview-05-20"  # 使用するモデルを指定(変更禁止)
+gemini_client = None
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    # 使用するモデルを指定 (例: gemini-1.5-flash-latest)
-    # モデル名は適宜、利用可能な最新のものや要件に合わせて変更してください。
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-    print("Gemini APIの設定が完了しました。")
+    if not GEMINI_API_KEY:
+        print("エラー: GEMINI_API_KEYが設定されていません。")
+    else:
+        gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            # http_options={'api_version': 'v1alpha'} # v1alpha may not be needed for basic models
+        )
+        print(f"Gemini APIクライアントの設定が完了しました。モデル: {GEMINI_MODEL_NAME}")
+
 except Exception as e:
-    print(f"Gemini APIの設定中にエラーが発生しました: {e}")
-    gemini_model = None
+    print(f"Gemini APIクライアントの初期化中にエラーが発生しました: {e}")
+    print(traceback.format_exc())
+    gemini_client = None
 
 # --- Discordボットのクライアント設定 ---
 intents = discord.Intents.default()
@@ -45,7 +70,7 @@ def get_db_connection():
             user=MYSQL_USER,
             password=MYSQL_PASSWORD,
             database=MYSQL_DATABASE,
-            port=MYSQL_PORT
+            port=int(MYSQL_PORT)  # ここで整数に変換
         )
         # print("MySQLデータベースへの接続に成功しました。")
         return conn
@@ -164,10 +189,14 @@ async def get_chat_history_for_api(thread_db_id: int, limit: int = 20) -> list:
         db_messages = cursor.fetchall()[::-1]
 
         for msg in db_messages:
-            history_for_api.append({
-                "role": msg["role"],
-                "parts": [{"text": msg["content"]}]
-            })
+            # Gemini APIの 'user' と 'model' の役割に合わせて変換
+            # DBには 'user' (ユーザー) と 'model' (AI) で保存されている
+            history_for_api.append(
+                types.Content(
+                    role=msg["role"], # 'user' or 'model'
+                    parts=[types.Part.from_text(msg["content"])]
+                )
+            )
         return history_for_api
     except mysql.connector.Error as err:
         print(f"チャット履歴取得エラー: {err}")
@@ -179,21 +208,38 @@ async def get_chat_history_for_api(thread_db_id: int, limit: int = 20) -> list:
 # --- Gemini API 関連 ---
 
 
-async def ask_gemini(prompt_text: str, chat_history_for_api: list) -> str | None:
-    """Gemini APIに問い合わせて応答を取得します。"""
-    if not gemini_model:
-        return "Gemini APIが設定されていません。"
+async def ask_gemini(chat_history_contents: list[types.Content]) -> str | None:
+    """Gemini APIに問い合わせて応答を取得します。chat_history_contentsには最新のプロンプトも含まれます。"""
+    if not gemini_client:
+        return "Gemini APIクライアントが設定されていません。"
+    if not chat_history_contents:
+        return "履歴が空のため、問い合わせできません。"
+
     try:
-        # Gemini APIは履歴を `history` パラメータで受け取る `start_chat` を使う
-        chat_session = gemini_model.start_chat(history=chat_history_for_api)
+        print(f"Geminiに問い合わせ中... モデル: {GEMINI_MODEL_NAME}, 履歴の要素数: {len(chat_history_contents)}")
+        # for i, content in enumerate(chat_history_contents):
+        #     print(f"  History item {i}: role='{content.role}', parts='{content.parts[0].text[:50]}...'")
 
-        # send_message_async を使用して非同期でメッセージを送信
-        response = await asyncio.to_thread(chat_session.send_message, prompt_text)
 
-        return response.text
+        # generate_contentは同期的なので、asyncio.to_threadで実行
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=f"models/{GEMINI_MODEL_NAME}", # モデル名は "models/" プレフィックスが必要な場合がある
+            contents=chat_history_contents,
+            generation_config=types.GenerateContentConfig(
+                response_mime_type="text/plain" # 応答形式を指定
+            )
+        )
+
+        if response and response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+            return response.candidates[0].content.parts[0].text
+        else:
+            print(f"Geminiからの予期しない応答形式です: {response}")
+            return "AIからの応答を正しく解析できませんでした。"
+
     except Exception as e:
         print(f"Gemini APIエラー: {e}")
-        # ユーザーにエラーを伝えるメッセージ。詳細はログに出力。
+        print(traceback.format_exc())
         return f"申し訳ありません、AIとの通信でエラーが発生しました。(詳細: {type(e).__name__})"
 
 
@@ -225,14 +271,14 @@ async def on_message(message: discord.Message):
     async with message.channel.typing():
         current_thread = None
         thread_db_id = None
-        chat_history_for_api = []
+        chat_history_for_gemini_api = []
 
         if is_in_thread_with_bot:
             # 既にボットが作成したスレッド内での会話
             current_thread = message.channel
             thread_db_id = await get_or_create_thread_db_id(current_thread.id, message.author.id, current_thread.parent_id)
             if thread_db_id:
-                chat_history_for_api = await get_chat_history_for_api(thread_db_id)
+                chat_history_for_gemini_api = await get_chat_history_for_api(thread_db_id)
         elif is_mentioned:
             # 新規メンションの場合、スレッドを作成
             try:
@@ -251,7 +297,7 @@ async def on_message(message: discord.Message):
                         f"新規スレッドを作成しました: {current_thread.name} (ID: {current_thread.id})")
                     thread_db_id = await get_or_create_thread_db_id(current_thread.id, message.author.id, current_thread.parent_id)
                     # 最初のメッセージなので履歴は空
-                    chat_history_for_api = []
+                    chat_history_for_gemini_api = []
 
             except discord.Forbidden:
                 await message.channel.send("スレッドを作成する権限がありません。")
@@ -276,21 +322,29 @@ async def on_message(message: discord.Message):
             user_prompt = message.content.replace(
                 f'<@!{client.user.id}>', '').replace(f'<@{client.user.id}>', '').strip()
 
-        if not user_prompt:  # メンションのみでメッセージがない場合は何もしない
+        if not user_prompt:
             if is_mentioned and not is_in_thread_with_bot:
-                await current_thread.send("こんにちは！何かお手伝いできることはありますか？")
-            return
+                # 以前はここで返信していたが、履歴に追加してGeminiに判断させることもできる
+                # await current_thread.send("こんにちは！何かお手伝いできることはありますか？")
+                # メンションのみの場合も履歴に追加してAIにコンテキストを与える
+                user_prompt = "こんにちは！何かお手伝いできることはありますか？" # デフォルトの応答を促すプロンプト
+            else: # スレッド内で空メッセージの場合は何もしない
+                return
 
         # ユーザーのメッセージをDBに保存
         await save_message(thread_db_id, "user", user_prompt)
-        # 保存したメッセージを履歴に追加（Geminiに渡すため）
-        chat_history_for_api.append(
-            {"role": "user", "parts": [{"text": user_prompt}]})
+        
+        # 更新されたチャット履歴をAPI用に取得
+        # save_message の後、get_chat_history_for_api を呼び出すことで、
+        # 最新のユーザーメッセージが履歴に含まれるようになる
+        chat_history_for_gemini_api = await get_chat_history_for_api(thread_db_id)
+
 
         # Geminiに問い合わせ
+        # chat_history_for_gemini_api には既に最新の user_prompt が含まれている
         print(
-            f"Geminiに問い合わせ中... スレッドID: {current_thread.id}, 履歴件数: {len(chat_history_for_api)}")
-        gemini_response_text = await ask_gemini(user_prompt, chat_history_for_api)
+            f"Geminiに問い合わせ準備完了... スレッドID: {current_thread.id}, 履歴要素数: {len(chat_history_for_gemini_api)}")
+        gemini_response_text = await ask_gemini(chat_history_for_gemini_api)
 
         if gemini_response_text:
             # ボットの応答をDBに保存
@@ -317,6 +371,6 @@ if __name__ == '__main__':
         try:
             client.run(DISCORD_BOT_TOKEN)
         except discord.LoginFailure:
-            print("エラー: Discordボットトークンが無効です。")
+            print("エラー: Discordボットトークンが無効です。" + DISCORD_BOT_TOKEN[:10] + "...")
         except Exception as e:
             print(f"ボット実行中に予期せぬエラーが発生しました: {e}")
