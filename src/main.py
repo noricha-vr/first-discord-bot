@@ -217,19 +217,36 @@ async def ask_gemini(chat_history_contents: list[types.Content]) -> str | None:
 
     try:
         print(f"Geminiに問い合わせ中... モデル: {GEMINI_MODEL_NAME}, 履歴の要素数: {len(chat_history_contents)}")
-        # for i, content in enumerate(chat_history_contents):
-        #     print(f"  History item {i}: role='{content.role}', parts='{content.parts[0].text[:50]}...'")
 
+        # Google検索ツールの設定
+        gemini_tools = [
+            types.Tool(google_search=types.GoogleSearch()),
+        ]
+        
+        # GenerateContentConfig オブジェクトを作成し、tools を含める
+        # クラス名を GenerationConfig から GenerateContentConfig に修正
+        gen_config = types.GenerateContentConfig(tools=gemini_tools)
 
         # generate_contentは同期的なので、asyncio.to_threadで実行
         response = await asyncio.to_thread(
             gemini_client.models.generate_content,
-            model=f"models/{GEMINI_MODEL_NAME}", # モデル名は "models/" プレフィックスが必要な場合がある
-            contents=chat_history_contents
+            model=f"models/{GEMINI_MODEL_NAME}",
+            contents=chat_history_contents,
+            config=gen_config  # tools を含んだ config オブジェクトを渡す
+            # ここに直接 tools=gemini_tools は不要
         )
 
         if response and response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-            return response.candidates[0].content.parts[0].text
+            part = response.candidates[0].content.parts[0]
+            if part.text:
+                return part.text
+            # TODO: もし part.function_call が返ってきた場合の処理を追加検討
+            # elif part.function_call:
+            #     print(f"Gemini API returned a function call: {part.function_call}")
+            #     return "AIがツールの使用を試みましたが、結果の処理は未実装です。"
+            else:
+                print(f"Geminiからの応答にテキストパートが含まれていません: {part}")
+                return "AIからの応答を正しく解析できませんでした。(テキスト不在)"
         else:
             print(f"Geminiからの予期しない応答形式です: {response}")
             return "AIからの応答を正しく解析できませんでした。"
