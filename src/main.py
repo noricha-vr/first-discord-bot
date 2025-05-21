@@ -194,7 +194,7 @@ async def get_chat_history_for_api(thread_db_id: int, limit: int = 20) -> list:
             history_for_api.append(
                 types.Content(
                     role=msg["role"], # 'user' or 'model'
-                    parts=[types.Part.from_text(msg["content"])]
+                    parts=[types.Part(text=msg["content"])]
                 )
             )
         return history_for_api
@@ -225,10 +225,7 @@ async def ask_gemini(chat_history_contents: list[types.Content]) -> str | None:
         response = await asyncio.to_thread(
             gemini_client.models.generate_content,
             model=f"models/{GEMINI_MODEL_NAME}", # モデル名は "models/" プレフィックスが必要な場合がある
-            contents=chat_history_contents,
-            generation_config=types.GenerateContentConfig(
-                response_mime_type="text/plain" # 応答形式を指定
-            )
+            contents=chat_history_contents
         )
 
         if response and response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
