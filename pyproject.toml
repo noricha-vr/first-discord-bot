@@ -11,6 +11,3 @@ dependencies = [
     "mysql-connector-python>=9.3.0",
     "pip>=25.1.1",
 ]
-
-[tool.uv.scripts]
-start = "python -m src"
